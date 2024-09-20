@@ -141,7 +141,8 @@ void MaybeClassInit(void* ptr) {
 static bool HookFunc(void* target, void* replace, void** backup) {
     // Dobby does not unprotect the memory before reading it
     if (!Unprotect(target)) return false;
-    return DobbyHook(target, replace, backup) == RS_SUCCESS;
+    return DobbyHook(target, reinterpret_cast<dobby_dummy_func_t>(replace),
+                     reinterpret_cast<dobby_dummy_func_t*>(backup)) == RS_SUCCESS;
 }
 
 static bool HookSymbol(void* handle, const char* symbol, void* replace, void** backup, bool required) {
@@ -295,7 +296,8 @@ std::string GetRuntimeLibraryName(JNIEnv* env) {
 
 jboolean PineEnhances_initClassInitMonitor(JNIEnv* env, jclass PineEnhances, jint sdk_level,
                                            jlong openElf, jlong findElfSymbol, jlong closeElf,
-                                           jlong getMethodDeclaringClass, jlong syncMethodEntry) {
+                                           jlong getMethodDeclaringClass, jlong syncMethodEntry,
+                                           jlong suspendVM, jlong resumeVM) {
      onClassInit_ = env->GetStaticMethodID(PineEnhances, "onClassInit", "(J)V");
      if (!onClassInit_) {
          LOGE("Unable to find onClassInit");
@@ -311,6 +313,8 @@ jboolean PineEnhances_initClassInitMonitor(JNIEnv* env, jclass PineEnhances, jin
      auto CloseElf = reinterpret_cast<void (*)(void*)>(closeElf);
      GetMethodDeclaringClass = reinterpret_cast<void* (*)(ArtMethod)>(getMethodDeclaringClass);
      SyncMethodEntry = reinterpret_cast<void (*)(ArtMethod, ArtMethod, const void*)>(syncMethodEntry);
+     auto SuspendVM = reinterpret_cast<void* (*)(JNIEnv*)>(suspendVM);
+     auto ResumeVM = reinterpret_cast<void (*)(void*)>(resumeVM);
 
      auto vm_library = GetRuntimeLibraryName(env);
      void* handle = OpenElf(vm_library.data());
@@ -322,6 +326,7 @@ jboolean PineEnhances_initClassInitMonitor(JNIEnv* env, jclass PineEnhances, jin
          return JNI_FALSE;
      }
 
+     void* cookie = SuspendVM(env);
      bool hooked = false;
 #define HOOK_FUNC(name) hooked |= HookFunc(name, (void*) replace_##name , (void**) &backup_##name)
 #define HOOK_SYMBOL(name, symbol, required) hooked |= HookSymbol(handle, symbol, (void*) replace_##name , (void**) &backup_##name , required)
@@ -333,14 +338,19 @@ jboolean PineEnhances_initClassInitMonitor(JNIEnv* env, jclass PineEnhances, jin
          HOOK_SYMBOL(ShouldUseInterpreterEntrypoint, "_ZN3art11ClassLinker30ShouldUseInterpreterEntrypointEPNS_9ArtMethodEPKv", false);
          if (!hooked) {
              // Android Tiramisu?
-             HOOK_SYMBOL(ShouldStayInSwitchInterpreter, "_ZN3art11interpreter29ShouldStayInSwitchInterpreterEPNS_9ArtMethodE", true);
+             HOOK_SYMBOL(ShouldStayInSwitchInterpreter, "_ZN3art11interpreter29ShouldStayInSwitchInterpreterEPNS_9ArtMethodE", false);
          }
          if (!hooked) {
-             LOGE("Failed to hook ShouldUseInterpreterEntrypoint/ShouldStayInSwitchInterpreter. Hook may not work.");
+             LOGW("Failed to hook ShouldUseInterpreterEntrypoint/ShouldStayInSwitchInterpreter. Hook may fail on debuggable builds.");
          }
          hooked = false;
 
-         HOOK_SYMBOL(UpdateMethodsCodeImpl, "_ZN3art15instrumentation15Instrumentation21UpdateMethodsCodeImplEPNS_9ArtMethodEPKv", true);
+         HOOK_SYMBOL(UpdateMethodsCodeImpl, "_ZN3art15instrumentation15Instrumentation21UpdateMethodsCodeImplEPNS_9ArtMethodEPKv", false);
+         if (!hooked) {
+             // UpdateMethodsCodeImpl is inlined, try fallback to UpdateMethodsCode
+             // We cannot always hook UpdateMethodsCode, as it may be too small to be overridden when UpdateMethodsCodeImpl not inlined
+             HOOK_SYMBOL(UpdateMethodsCode, "_ZN3art15instrumentation15Instrumentation17UpdateMethodsCodeEPNS_9ArtMethodEPKv", true);
+         }
      }
      else
          HOOK_SYMBOL(UpdateMethodsCode, "_ZN3art15instrumentation15Instrumentation17UpdateMethodsCodeEPNS_9ArtMethodEPKv", true);
@@ -365,7 +375,7 @@ jboolean PineEnhances_initClassInitMonitor(JNIEnv* env, jclass PineEnhances, jin
          HOOK_SYMBOL(FixupStaticTrampolines, "_ZN3art11ClassLinker22FixupStaticTrampolinesEPNS_6mirror5ClassE", true);
      }
 #undef HOOK_SYMBOL
-
+     ResumeVM(cookie);
      CloseElf(handle);
 
      if (!hooked) {
@@ -376,7 +386,7 @@ jboolean PineEnhances_initClassInitMonitor(JNIEnv* env, jclass PineEnhances, jin
 }
 
  JNINativeMethod JNI_METHODS[] = {
-         {"initClassInitMonitor", "(IJJJJJ)Z", (void*) PineEnhances_initClassInitMonitor},
+         {"initClassInitMonitor", "(IJJJJJJJ)Z", (void*) PineEnhances_initClassInitMonitor},
          {"careClassInit", "(J)V", (void*) PineEnhances_careClassInit},
          {"recordMethodHooked", "(JJJ)V", (void*) PineEnhances_recordMethodHooked}
 };

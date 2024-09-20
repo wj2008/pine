@@ -121,32 +121,42 @@ static int FakeHandleHiddenApi() {
 void Android::DisableHiddenApiPolicy(const ElfImage* handle, bool application, bool platform) {
     auto trampoline_installer = TrampolineInstaller::GetDefault();
     void* replace = reinterpret_cast<void*>(FakeHandleHiddenApi);
+    bool failed = false;
 
-#define HOOK_SYMBOL(symbol) do { \
-void *target = handle->GetSymbolAddress(symbol); \
+#define HOOK_SYMBOL(symbol, warn_if_missing) do { \
+void *target = handle->GetSymbolAddress(symbol, warn_if_missing); \
 if (LIKELY(target))  \
     trampoline_installer->NativeHookNoBackup(target, replace); \
 else  \
-    LOGE("DisableHiddenApiPolicy: symbol %s not found", symbol); \
+    failed = true; \
 } while(false)
 
     if (Android::version >= Android::kQ) {
-        if (application) {
+        if (LIKELY(application)) {
             // Android Q, for Domain::kApplication
-            HOOK_SYMBOL("_ZN3art9hiddenapi6detail28ShouldDenyAccessToMemberImplINS_8ArtFieldEEEbPT_NS0_7ApiListENS0_12AccessMethodE");
-            HOOK_SYMBOL("_ZN3art9hiddenapi6detail28ShouldDenyAccessToMemberImplINS_9ArtMethodEEEbPT_NS0_7ApiListENS0_12AccessMethodE");
+            HOOK_SYMBOL("_ZN3art9hiddenapi6detail28ShouldDenyAccessToMemberImplINS_8ArtFieldEEEbPT_NS0_7ApiListENS0_12AccessMethodE", false);
+            HOOK_SYMBOL("_ZN3art9hiddenapi6detail28ShouldDenyAccessToMemberImplINS_9ArtMethodEEEbPT_NS0_7ApiListENS0_12AccessMethodE", false);
         }
 
-        if (platform) {
+        if (LIKELY(platform)) {
             // For Domain::kPlatform
-            HOOK_SYMBOL("_ZN3art9hiddenapi6detail30HandleCorePlatformApiViolationINS_8ArtFieldEEEbPT_RKNS0_13AccessContextENS0_12AccessMethodENS0_17EnforcementPolicyE");
-            HOOK_SYMBOL("_ZN3art9hiddenapi6detail30HandleCorePlatformApiViolationINS_9ArtMethodEEEbPT_RKNS0_13AccessContextENS0_12AccessMethodENS0_17EnforcementPolicyE");
+            HOOK_SYMBOL("_ZN3art9hiddenapi6detail30HandleCorePlatformApiViolationINS_8ArtFieldEEEbPT_RKNS0_13AccessContextENS0_12AccessMethodENS0_17EnforcementPolicyE", false);
+            HOOK_SYMBOL("_ZN3art9hiddenapi6detail30HandleCorePlatformApiViolationINS_9ArtMethodEEEbPT_RKNS0_13AccessContextENS0_12AccessMethodENS0_17EnforcementPolicyE", false);
+        }
+
+        if (UNLIKELY(failed)) {
+            // These functions are inlined for arm32 on Android 15, but not for arm64
+            // If any symbol cannot be found, fallback to hook ShouldDenyAccessToMember
+            // The flag will only be set if we need the feature, so we don't need to check it
+
+            HOOK_SYMBOL("_ZN3art9hiddenapi24ShouldDenyAccessToMemberINS_8ArtFieldEEEbPT_RKNSt3__18functionIFNS0_13AccessContextEvEEENS0_12AccessMethodE", true);
+            HOOK_SYMBOL("_ZN3art9hiddenapi24ShouldDenyAccessToMemberINS_9ArtMethodEEEbPT_RKNSt3__18functionIFNS0_13AccessContextEvEEENS0_12AccessMethodE", true);
         }
     } else {
         // Android P, all accesses from platform domain will be allowed
-        if (application) {
-            HOOK_SYMBOL("_ZN3art9hiddenapi6detail19GetMemberActionImplINS_8ArtFieldEEENS0_6ActionEPT_NS_20HiddenApiAccessFlags7ApiListES4_NS0_12AccessMethodE");
-            HOOK_SYMBOL("_ZN3art9hiddenapi6detail19GetMemberActionImplINS_9ArtMethodEEENS0_6ActionEPT_NS_20HiddenApiAccessFlags7ApiListES4_NS0_12AccessMethodE");
+        if (LIKELY(application)) {
+            HOOK_SYMBOL("_ZN3art9hiddenapi6detail19GetMemberActionImplINS_8ArtFieldEEENS0_6ActionEPT_NS_20HiddenApiAccessFlags7ApiListES4_NS0_12AccessMethodE", true);
+            HOOK_SYMBOL("_ZN3art9hiddenapi6detail19GetMemberActionImplINS_9ArtMethodEEENS0_6ActionEPT_NS_20HiddenApiAccessFlags7ApiListES4_NS0_12AccessMethodE", true);
         }
     }
 
@@ -212,8 +222,9 @@ void Android::InitMembersFromRuntime(JavaVM* jvm, const ElfImage* handle) {
     // https://android.googlesource.com/platform/art/+/4dcac3629ea5925e47b522073f3c49420e998911
     // https://github.com/crdroidandroid/android_art/commit/aa7999027fa830d0419c9518ab56ceb7fcf6f7f1
     // https://android.googlesource.com/platform/art/+/849d09a81907f16d8ccc6019b8baf86a304b730c
-    bool has_smaller_irt = version >= kT || handle->GetSymbolAddress(
-            "_ZN3art17SmallIrtAllocator10DeallocateEPNS_8IrtEntryE", false) != nullptr;
+    bool has_smaller_irt = version >= kT
+            || handle->HasSymbol("_ZN3art17SmallIrtAllocator10DeallocateEPNS_8IrtEntryE")
+            || handle->HasSymbol("_ZN3art3jni17SmallLrtAllocatorC2Ev");
 
     std::vector<size_t> known_offsets = OffsetOfJavaVm(has_smaller_irt);
     size_t jvm_offset = 0;
